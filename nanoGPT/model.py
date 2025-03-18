@@ -44,7 +44,8 @@ class Attention(nn.Module):
                              Valid values: CausalSelfAttention, MomentumAttention, AdaGradAttention, \
                              RMSPropAttention, AdamAttention\n \
                              Current: {config.attention_layer}")
-        
+        print(f"Attention used: {config.attention_layer}")
+
     def forward(self, x, m):
         return self.attn_layer(x, m)
 
