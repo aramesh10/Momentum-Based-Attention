@@ -33,7 +33,7 @@ from model import GPTConfig, GPT
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
 out_dir = 'out'
-eval_interval = 2000
+eval_interval = 20
 log_interval = 1
 eval_iters = 200
 eval_only = False # if True, script exits right after the first eval
@@ -46,21 +46,22 @@ wandb_project = 'owt'
 wandb_run_name = 'gpt2' # 'run' + str(time.time())
 
 # data
-dataset = 'openwebtext'
+dataset = 'shakespeare'
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
 batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
 
 # model
-n_layer = 12
-n_head = 12
-n_embd = 768
+n_layer = 4
+n_head = 4
+n_embd = 32
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
+attention_layer = "CausalSelfAttention" # CausalSelfAttention MomentumAttention AdaGradAttention RMSPropAttention AdamAttention
 
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
-max_iters = 600000 # total number of training iterations
+max_iters = 15000 # total number of training iterations
 weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
@@ -158,7 +159,9 @@ model_args = dict(n_layer=n_layer,
                   block_size=block_size,
                   bias=bias, 
                   vocab_size=None, 
-                  dropout=dropout) # start with model_args from command line
+                  dropout=dropout,
+                  device=device
+                  ) # start with model_args from command line
 if init_from == 'scratch':
     print("Initializing a new model from scratch")
     
@@ -321,7 +324,7 @@ while True:
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = get_batch('train')
         # backward pass, with gradient scaling if training in fp16
-        scaler.scale(loss).backward()
+        scaler.scale(loss).backward(retain_graph=True)
     # clip the gradient
     if grad_clip != 0.0:
         scaler.unscale_(optimizer)

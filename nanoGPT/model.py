@@ -26,6 +26,28 @@ class LayerNorm(nn.Module):
     def forward(self, input):
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
+class Attention(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        if config.attention_layer == "CausalSelfAttention":
+            self.attn_layer = CausalSelfAttention(config)
+        elif config.attention_layer == "MomentumAttention":
+            self.attn_layer = MomentumAttention(config)
+        elif config.attention_layer == "AdaGradAttention":
+            self.attn_layer = AdaGradAttention(config)
+        elif config.attention_layer == "RMSPropAttention":
+            self.attn_layer = RMSPropAttention(config)
+        elif config.attention_layer == "AdamAttention":
+            self.attn_layer = AdamAttention(config)
+        else:
+            raise ValueError(f"config.attention_layer not valid.\n \
+                             Valid values: CausalSelfAttention, MomentumAttention, AdaGradAttention, \
+                             RMSPropAttention, AdamAttention\n \
+                             Current: {config.attention_layer}")
+        
+    def forward(self, x, m):
+        return self.attn_layer(x, m)
+
 class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
@@ -49,7 +71,7 @@ class CausalSelfAttention(nn.Module):
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
 
-    def forward(self, x):
+    def forward(self, x, m):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
@@ -73,7 +95,7 @@ class CausalSelfAttention(nn.Module):
 
         # output projection
         y = self.resid_dropout(self.c_proj(y))
-        return y
+        return y, None
 
 # Momentum-Based Attention
 class MomentumAttention(nn.Module):
@@ -102,8 +124,8 @@ class MomentumAttention(nn.Module):
                                   .view(1, 1, config.block_size, config.block_size))
         
         # momentum
-        self.t = config.t
-        self.eta = config.eta
+        self.t = 0
+        self.eta = torch.tensor([0.01]).to(config.device)
 
     def forward(self, x, m):
         """
@@ -135,8 +157,9 @@ class MomentumAttention(nn.Module):
         y = self.resid_dropout(self.c_proj(y))
 
         # momentum
-        m = m + math.pow(self.eta, self.t)
         y = y + m
+        m = m + torch.pow(self.eta, self.t) * y
+        self.t = self.t + 1
 
         return y, m
     
@@ -359,14 +382,17 @@ class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
-        self.attn = CausalSelfAttention(config)
+        self.attn = Attention(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
-        return x
+    def forward(self, x, m):
+        x = self.ln_1(x)
+        x_attn, m_attn = self.attn(x, m)
+        x = x + x_attn
+        x = self.ln_2(x)
+        x = x + self.mlp(x)
+        return x, m_attn
 
 @dataclass
 class GPTConfig:
@@ -377,7 +403,8 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
-    attention_layer: str = "" # 
+    attention_layer: str = "CausalSelfAttention" # CausalSelfAttention MomentumAttention AdaGradAttention RMSPropAttention AdamAttention
+    device: str = "cuda" # 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 
 class GPT(nn.Module):
 
@@ -385,7 +412,9 @@ class GPT(nn.Module):
         super().__init__()
         assert config.vocab_size is not None
         assert config.block_size is not None
+        assert config.attention_layer in ["CausalSelfAttention", "MomentumAttention", "AdaGradAttention", "RMSPropAttention", "AdamAttention"]
         self.config = config
+        self.m = torch.zeros(config.n_embd).to(config.device)
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
@@ -441,8 +470,9 @@ class GPT(nn.Module):
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
+        self.m = torch.zeros(self.config.n_embd).to(self.config.device)
         for block in self.transformer.h:
-            x = block(x)
+            x, self.m = block(x, self.m)
         x = self.transformer.ln_f(x)
 
         if targets is not None:
