@@ -27,18 +27,18 @@ class LayerNorm(nn.Module):
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
 class Attention(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, layer_num):
         super().__init__()
         if config.attention_layer == "CausalSelfAttention":
             self.attn_layer = CausalSelfAttention(config)
         elif config.attention_layer == "MomentumAttention":
-            self.attn_layer = MomentumAttention(config)
+            self.attn_layer = MomentumAttention(config, layer_num)
         elif config.attention_layer == "AdaGradAttention":
-            self.attn_layer = AdaGradAttention(config)
+            self.attn_layer = AdaGradAttention(config, layer_num)
         elif config.attention_layer == "RMSPropAttention":
-            self.attn_layer = RMSPropAttention(config)
+            self.attn_layer = RMSPropAttention(config, layer_num)
         elif config.attention_layer == "AdamAttention":
-            self.attn_layer = AdamAttention(config)
+            self.attn_layer = AdamAttention(config, layer_num)
         else:
             raise ValueError(f"config.attention_layer not valid.\n \
                              Valid values: CausalSelfAttention, MomentumAttention, AdaGradAttention, \
@@ -105,7 +105,7 @@ class MomentumAttention(nn.Module):
     Introduced in https://arxiv.org/pdf/2212.10559v2
     """
 
-    def __init__(self, config):
+    def __init__(self, config, layer_num):
         super().__init__()
         assert config.n_embd % config.n_head == 0
 
@@ -125,8 +125,9 @@ class MomentumAttention(nn.Module):
                                   .view(1, 1, config.block_size, config.block_size))
         
         # momentum
-        self.t = 0
-        self.eta = torch.tensor([0.01]).to(config.device)
+        t = layer_num
+        eta = torch.tensor([config.momentum_eta]).to(config.device)
+        self.momentum_scale = torch.pow(eta, t)
 
     def forward(self, x, m):
         """
@@ -159,9 +160,7 @@ class MomentumAttention(nn.Module):
 
         # momentum
         y = y + m
-        m = m + torch.pow(self.eta, self.t) * y
-        self.t = self.t + 1
-
+        m = m + self.momentum_scale * y
         return y, m
     
 class AdaGradAttention(nn.Module):
@@ -171,7 +170,7 @@ class AdaGradAttention(nn.Module):
     """
     #TODO: Implement AdaGrad Attention
 
-    def __init__(self, config):
+    def __init__(self, config, layer_num):
         super().__init__()
         assert config.n_embd % config.n_head == 0
 
@@ -191,8 +190,10 @@ class AdaGradAttention(nn.Module):
                                   .view(1, 1, config.block_size, config.block_size))
         
         # momentum
-        self.t = config.t
-        self.eta = config.eta
+        t = layer_num
+        eta = torch.tensor([config.momentum_eta]).to(config.device)
+        self.momentum_scale = torch.pow(eta, t)
+        self.eps = 1E-5
 
     def forward(self, x, m):
         """
@@ -224,10 +225,10 @@ class AdaGradAttention(nn.Module):
         y = self.resid_dropout(self.c_proj(y))
 
         # AdaGrad momentum
-        #TODO: Implement AdaGrad term
-        m = m + math.pow(self.eta, self.t)
         y = y + m
-
+        X = y * y
+        adagrad_update = torch.pow(X+self.eps, -0.5) * y
+        m = m + self.momentum_scale * adagrad_update
         return y, m
 
 class RMSPropAttention(nn.Module):
@@ -380,10 +381,10 @@ class MLP(nn.Module):
 
 class Block(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config, layer_num):
         super().__init__()
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
-        self.attn = Attention(config)
+        self.attn = Attention(config, layer_num)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
@@ -405,6 +406,7 @@ class GPTConfig:
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     attention_layer: str = "CausalSelfAttention" # CausalSelfAttention MomentumAttention AdaGradAttention RMSPropAttention AdamAttention
+    momentum_eta: float = 0.90,
     device: str = "cuda" # 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 
 class GPT(nn.Module):
@@ -421,7 +423,7 @@ class GPT(nn.Module):
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            h = nn.ModuleList([Block(config, i) for i in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
