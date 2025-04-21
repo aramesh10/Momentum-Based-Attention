@@ -238,7 +238,7 @@ class RMSPropAttention(nn.Module):
     """
     #TODO: Implement RMSProp Attention
 
-    def __init__(self, config):
+    def __init__(self, config, layer_num):
         super().__init__()
         assert config.n_embd % config.n_head == 0
 
@@ -258,12 +258,16 @@ class RMSPropAttention(nn.Module):
                                   .view(1, 1, config.block_size, config.block_size))
         
         # momentum
-        self.t = config.t
-        self.eta = config.eta
+        self.rho = 0.9 
+        self.eps = 1e-8
+        self.layer_num = layer_num 
+        self.eta = config.momentum_eta 
+        self.momentum_scale = torch.pow(torch.tensor([self.eta]).to(config.device), self.layer_num)
+
 
     def forward(self, x, m):
         """
-        Forward implementation of MomentumAttention
+        Forward implementation of RMSPropAttention
         params:
             x: input (B, T, C)
                 B - batch size
@@ -291,10 +295,12 @@ class RMSPropAttention(nn.Module):
         y = self.resid_dropout(self.c_proj(y))
 
         # RMSProp momentum
-        #TODO: Implement RMSProp term
-        m = m + math.pow(self.eta, self.t)
-        y = y + m
-
+        if m is None:
+            m = torch.zeros_like(y) 
+        
+        X = y * y
+        m = self.rho * m + (1 - self.rho) * X
+        y = y + self.momentum_scale * (y / (torch.sqrt(m) + self.eps))
         return y, m
 
 class AdamAttention(nn.Module):
@@ -304,7 +310,7 @@ class AdamAttention(nn.Module):
     """
     #TODO: Implement Adam Attention
 
-    def __init__(self, config):
+    def __init__(self, config, layer_num):
         super().__init__()
         assert config.n_embd % config.n_head == 0
 
@@ -324,12 +330,17 @@ class AdamAttention(nn.Module):
                                   .view(1, 1, config.block_size, config.block_size))
         
         # momentum
-        self.t = config.t
-        self.eta = config.eta
+        self.beta1 = config.beta1
+        self.beta2 = config.beta2 
+        self.eps = 1e-8 
+        self.layer_num = layer_num
+        self.eta = config.momentum_eta 
+        self.momentum_scale = torch.pow(torch.tensor([self.eta]).to(config.device), self.layer_num)
 
-    def forward(self, x, m):
+
+    def forward(self, x, m_prime):
         """
-        Forward implementation of MomentumAttention
+        Forward implementation of AdamAttention
         params:
             x: input (B, T, C)
                 B - batch size
@@ -357,9 +368,18 @@ class AdamAttention(nn.Module):
         y = self.resid_dropout(self.c_proj(y))
 
         # Adam momentum
-        #TODO: Implement Adam term
-        m = m + math.pow(self.eta, self.t)
-        y = y + m
+        if m_prime is None:
+            m = torch.zeros_like(y)
+            v = torch.zeros_like(y)
+        else:
+            m, v = m_prime
+        m = self.beta1 * m + (1 - self.beta1) * y
+        v = self.beta2 * v + (1 - self.beta2) * (y * y)
+        
+        m_hat = m / (1 - self.beta1 ** (self.layer_num + 1))
+        v_hat = v / (1 - self.beta2 ** (self.layer_num + 1))
+
+        y = y + self.momentum_scale * (m_hat / (torch.sqrt(v_hat) + self.eps))
 
         return y, m
 
