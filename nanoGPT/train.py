@@ -39,6 +39,8 @@ parser.add_argument("--out_dir", help="output directory", type=str)
 parser.add_argument("--batch_size", help="batch size", type=int)
 parser.add_argument("--attention_layer", help="attention layer used", type=str)
 parser.add_argument("--momentum_eta", help="momentum eta", type=float)
+parser.add_argument("--beta1", help="beta1", type=float)
+parser.add_argument("--beta2", help="beta2", type=float)
 args = parser.parse_args()
 
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -75,8 +77,8 @@ momentum_eta = args.momentum_eta #0.90
 learning_rate = 6e-4 # max learning rate
 max_iters = 6000 # total number of training iterations
 weight_decay = 1e-1
-beta1 = 0.9
-beta2 = 0.95
+beta1 = args.beta1
+beta2 = args.beta2
 grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
 
 # learning rate decay settings
@@ -90,6 +92,7 @@ backend = 'nccl' # 'nccl', 'gloo', etc.
 
 # system
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
+# dtype = 'float32' 
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = True # use PyTorch 2.0 to compile the model to be faster
 
@@ -231,7 +234,7 @@ if block_size < model.config.block_size:
 model.to(device)
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
-scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
+scaler = torch.GradScaler("cuda", enabled=(dtype == 'float16'))
 
 # optimizer
 optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
@@ -291,7 +294,6 @@ local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
 while True:
-
     # determine and set the learning rate for this iteration
     lr = get_lr(iter_num) if decay_lr else learning_rate
     for param_group in optimizer.param_groups:
@@ -337,6 +339,7 @@ while True:
         with ctx:
             logits, loss = model(X, Y)
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
+
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = get_batch('train')
         # backward pass, with gradient scaling if training in fp16
@@ -348,6 +351,11 @@ while True:
     # step the optimizer and scaler if training in fp16
     scaler.step(optimizer)
     scaler.update()
+
+
+    # for param in model.parameters():
+    #     print(param.grad.view(-1))
+
     # flush the gradients as soon as we can, no need for this memory anymore
     optimizer.zero_grad(set_to_none=True)
 

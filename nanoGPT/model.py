@@ -39,15 +39,17 @@ class Attention(nn.Module):
             self.attn_layer = RMSPropAttention(config, layer_num)
         elif config.attention_layer == "AdamAttention":
             self.attn_layer = AdamAttention(config, layer_num)
+        elif config.attention_layer == "MuonAttention":
+            self.attn_layer = MuonAttention(config, layer_num)
         else:
             raise ValueError(f"config.attention_layer not valid.\n \
                              Valid values: CausalSelfAttention, MomentumAttention, AdaGradAttention, \
-                             RMSPropAttention, AdamAttention\n \
+                             RMSPropAttention, AdamAttention, MuonAttention\n \
                              Current: {config.attention_layer}")
         print(f"Attention used: {config.attention_layer}")
 
-    def forward(self, x, m):
-        return self.attn_layer(x, m)
+    def forward(self, x, m, v):
+        return self.attn_layer(x, m, v)
 
 class CausalSelfAttention(nn.Module):
 
@@ -236,8 +238,6 @@ class RMSPropAttention(nn.Module):
     RMSProp Attention
     Introduced in 10-707 Final Project
     """
-    #TODO: Implement RMSProp Attention
-
     def __init__(self, config, layer_num):
         super().__init__()
         assert config.n_embd % config.n_head == 0
@@ -258,11 +258,13 @@ class RMSPropAttention(nn.Module):
                                   .view(1, 1, config.block_size, config.block_size))
         
         # momentum
-        self.rho = 0.9 
+        self.rho = 0.1
         self.eps = 1e-8
         self.layer_num = layer_num 
         self.eta = config.momentum_eta 
         self.momentum_scale = torch.pow(torch.tensor([self.eta]).to(config.device), self.layer_num)
+
+        print(f"self.rho = {self.rho}")
 
 
     def forward(self, x, m):
@@ -297,10 +299,17 @@ class RMSPropAttention(nn.Module):
         # RMSProp momentum
         if m is None:
             m = torch.zeros_like(y) 
-        
+            
+        y = y + m
         X = y * y
-        m = self.rho * m + (1 - self.rho) * X
-        y = y + self.momentum_scale * (y / (torch.sqrt(m) + self.eps))
+        rmsprop_update = torch.pow(X+self.eps, -0.5) * y
+        m = self.rho * m + (1 - self.rho) * rmsprop_update
+        # print(m.shape)
+
+        # y = y + m
+        # X = y * y
+        # adagrad_update = torch.pow(X+self.eps, -0.5) * y
+        # m = m + self.momentum_scale * adagrad_update
         return y, m
 
 class AdamAttention(nn.Module):
@@ -308,8 +317,6 @@ class AdamAttention(nn.Module):
     Adam Attention
     Introduced in 10-707 Final Project
     """
-    #TODO: Implement Adam Attention
-
     def __init__(self, config, layer_num):
         super().__init__()
         assert config.n_embd % config.n_head == 0
@@ -338,7 +345,7 @@ class AdamAttention(nn.Module):
         self.momentum_scale = torch.pow(torch.tensor([self.eta]).to(config.device), self.layer_num)
 
 
-    def forward(self, x, m_prime):
+    def forward(self, x, m_prime, v_prime):
         """
         Forward implementation of AdamAttention
         params:
@@ -372,7 +379,9 @@ class AdamAttention(nn.Module):
             m = torch.zeros_like(y)
             v = torch.zeros_like(y)
         else:
-            m, v = m_prime
+            m = m_prime
+            v = v_prime
+
         m = self.beta1 * m + (1 - self.beta1) * y
         v = self.beta2 * v + (1 - self.beta2) * (y * y)
         
@@ -381,7 +390,88 @@ class AdamAttention(nn.Module):
 
         y = y + self.momentum_scale * (m_hat / (torch.sqrt(v_hat) + self.eps))
 
+        return y, m, v
+
+class MuonAttention(nn.Module):
+    """
+    Muon Attention
+    Introduced in 10-707 Final Project
+    https://kellerjordan.github.io/posts/muon/
+    """
+    def __init__(self, config, layer_num):
+        super().__init__()
+        assert config.n_embd % config.n_head == 0
+
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+
+        # regularization
+        self.attn_dropout = nn.Dropout(config.dropout)
+        self.resid_dropout = nn.Dropout(config.dropout)
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        self.dropout = config.dropout
+
+        # causal mask to ensure that attention is only applied to the left in the input sequence
+        self.register_buffer("bias", 
+                             torch.tril(torch.ones(config.block_size, config.block_size))
+                                  .view(1, 1, config.block_size, config.block_size))
+        
+        # momentum
+        t = layer_num
+        eta = torch.tensor([config.momentum_eta]).to(config.device)
+        self.momentum_scale = torch.pow(eta, t)
+
+    def forward(self, x, m):
+        """
+        Forward implementation of AdamAttention
+        params:
+            x: input (B, T, C)
+                B - batch size
+                T - sequence length
+                C - embedding dimensionality (n_embd)
+            m: momentum term at t-1
+            t: t-th layer
+        returns:
+            y: momentum attention
+            m: momentum term at t
+        """
+        B, T, C = x.size() 
+        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+
+        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+        att = F.softmax(att, dim=-1)
+        att = self.attn_dropout(att)
+        y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        y = self.resid_dropout(self.c_proj(y))
+
+        # muon momentum
+        o = self.newtonschulz5(m, steps=1)
+        y = y + o
+        m = m + self.momentum_scale * y
+
         return y, m
+    
+    def newtonschulz5(self, G, steps=5, eps=1e-7):
+        a, b, c = (3.4445, -4.7750, 2.0315)
+        X = G
+        for batch in range(G.shape[0]):
+            X[batch] /= (X[batch].norm() + eps)
+        if G.size(1) > G.size(2):
+            X = torch.transpose(X, 1, 2)
+        for _ in range(steps):
+            A = torch.bmm(X, torch.transpose(X, 1, 2))
+            B = b * A + c * torch.bmm(A, A)
+            X = a * X + torch.bmm(B, X)
+        if G.size(1) > G.size(2):
+            X = torch.transpose(X, 1, 2)
+        return X
 
 class MLP(nn.Module):
 
@@ -427,7 +517,9 @@ class GPTConfig:
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     attention_layer: str = "CausalSelfAttention" # CausalSelfAttention MomentumAttention AdaGradAttention RMSPropAttention AdamAttention
     momentum_eta: float = 0.90,
-    device: str = "cuda" # 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
+    device: str = "cuda", # 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
+    beta1: float = 0.90,
+    beta2: float = 0.95
 
 class GPT(nn.Module):
 
@@ -435,7 +527,12 @@ class GPT(nn.Module):
         super().__init__()
         assert config.vocab_size is not None
         assert config.block_size is not None
-        assert config.attention_layer in ["CausalSelfAttention", "MomentumAttention", "AdaGradAttention", "RMSPropAttention", "AdamAttention"]
+        assert config.attention_layer in ["CausalSelfAttention", 
+                                          "MomentumAttention", 
+                                          "AdaGradAttention", 
+                                          "RMSPropAttention", 
+                                          "AdamAttention", 
+                                          "MuonAttention"]
         self.config = config
         self.m = torch.zeros(config.n_embd).to(config.device)
 
@@ -493,9 +590,10 @@ class GPT(nn.Module):
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
-        self.m = torch.zeros(self.config.n_embd).to(self.config.device)
+        self.m = torch.zeros((self.config.n_embd)).to(self.config.device)
+        self.v = torch.zeros((self.config.n_embd)).to(self.config.device)
         for block in self.transformer.h:
-            x, self.m = block(x, self.m)
+            x, self.m = block(x, self.m, self.v)
         x = self.transformer.ln_f(x)
 
         if targets is not None:
