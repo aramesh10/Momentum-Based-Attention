@@ -29,6 +29,7 @@ class LayerNorm(nn.Module):
 class Attention(nn.Module):
     def __init__(self, config, layer_num):
         super().__init__()
+        self.layer_used = config.attention_layer
         if config.attention_layer == "CausalSelfAttention":
             self.attn_layer = CausalSelfAttention(config)
         elif config.attention_layer == "MomentumAttention":
@@ -48,8 +49,10 @@ class Attention(nn.Module):
                              Current: {config.attention_layer}")
         print(f"Attention used: {config.attention_layer}")
 
-    def forward(self, x, m, v):
+    def forward(self, x, m):
+      if self.layer_used == "AdamAttention":
         return self.attn_layer(x, m, v)
+      return self.attn_layer(x, m)
 
 class CausalSelfAttention(nn.Module):
 
@@ -591,9 +594,9 @@ class GPT(nn.Module):
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
         self.m = torch.zeros((self.config.n_embd)).to(self.config.device)
-        self.v = torch.zeros((self.config.n_embd)).to(self.config.device)
+        # self.v = torch.zeros((self.config.n_embd)).to(self.config.device)
         for block in self.transformer.h:
-            x, self.m = block(x, self.m, self.v)
+            x, self.m = block(x, self.m)
         x = self.transformer.ln_f(x)
 
         if targets is not None:
