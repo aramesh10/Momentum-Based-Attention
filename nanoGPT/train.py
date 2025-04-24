@@ -59,13 +59,13 @@ wandb_project = args.wandb_project # 'Advance Deep Learning Project'
 wandb_run_name = args.wandb_run_name # 'Baseline' # 'run' + str(time.time())
 
 # data
-dataset = 'shakespeare'
+dataset = 'sst2'
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
 batch_size = args.batch_size # 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
 
 # model
-n_layer = 4
+n_layer = 16
 n_head = 4
 n_embd = 32
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
@@ -139,6 +139,23 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 
 # poor man's data loader
 data_dir = os.path.join('data', dataset)
+print(f"Data Directory: {data_dir}")
+# def get_batch(split):
+#     # We recreate np.memmap every batch to avoid a memory leak, as per
+#     # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
+#     if split == 'train':
+#         data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
+#     else:
+#         data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
+#     ix = torch.randint(len(data) - block_size, (batch_size,))
+#     x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
+#     y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
+#     if device_type == 'cuda':
+#         # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
+#         x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
+#     else:
+#         x, y = x.to(device), y.to(device)
+#     return x, y
 def get_batch(split):
     # We recreate np.memmap every batch to avoid a memory leak, as per
     # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
@@ -146,9 +163,12 @@ def get_batch(split):
         data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
     else:
         data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
-    ix = torch.randint(len(data) - block_size, (batch_size,))
-    x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
-    y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
+    
+    blockSize = 1024
+    num_examples = len(data) // (blockSize+1)
+    x = torch.stack([torch.tensor(data[(1025*i):(1025*i + 1024)].astype(np.int64)) for i in range(num_examples)])
+    y = torch.stack([torch.nn.functional.one_hot(torch.tensor(data[(1025*i+1024)].astype(np.int64)), 2) for i in range(num_examples)])
+
     if device_type == 'cuda':
         # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
         x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
@@ -338,6 +358,7 @@ while True:
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
             logits, loss = model(X, Y)
+            print(logits)
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
 
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
@@ -351,7 +372,6 @@ while True:
     # step the optimizer and scaler if training in fp16
     scaler.step(optimizer)
     scaler.update()
-
 
     # for param in model.parameters():
     #     print(param.grad.view(-1))

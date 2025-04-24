@@ -23,9 +23,9 @@ if __name__ == '__main__':
     dataset = load_dataset("stanfordnlp/sst2", num_proc=num_proc_load_dataset)
 
     # owt by default only contains the 'train' split, so create a test split
+    # split_dataset = dataset
     split_dataset = dataset["train"].train_test_split(test_size=0.10, seed=2357, shuffle=True)
     split_dataset['val'] = split_dataset.pop('test') # rename the test split to val
-    print(split_dataset)
     # this results in:
     # >>> split_dataset
     # DatasetDict({
@@ -44,7 +44,8 @@ if __name__ == '__main__':
         ids = enc.encode_ordinary(example['sentence']) # encode_ordinary ignores any special tokens
         ids.append(enc.eot_token) # add the end of text token, e.g. 50256 for gpt2 bpe
         # note: I think eot should be prepended not appended... hmm. it's called "eot" though...
-        out = {'ids': ids, 'len': len(ids)}
+        label = example['label']
+        out = {'ids': ids, 'label':label, 'len': len(ids)}
         return out
 
     # tokenize the dataset
@@ -56,25 +57,37 @@ if __name__ == '__main__':
     )
 
     # concatenate all the ids in each dataset into one large file we can use for training
+    # for split, dset in tokenized.items():
+    #     arr_len = np.sum(dset['len'], dtype=np.uint64)
+    #     filename = os.path.join(os.path.dirname(__file__), f'{split}.bin')
+    #     dtype = np.uint16 # (can do since enc.max_token_value == 50256 is < 2**16)
+    #     arr = np.memmap(filename, dtype=dtype, mode='w+', shape=(arr_len,))
+    #     total_batches = 1024
+
+    #     idx = 0
+    #     for batch_idx in tqdm(range(total_batches), desc=f'writing {filename}'):
+    #         # Batch together samples for faster write
+    #         batch = dset.shard(num_shards=total_batches, index=batch_idx, contiguous=True).with_format('numpy')
+    #         arr_batch = np.concatenate(batch['ids'])
+    #         # Write into mmap
+    #         arr[idx : idx + len(arr_batch)] = arr_batch
+    #         idx += len(arr_batch)
+    #     arr.flush()
+
     for split, dset in tokenized.items():
-        arr_len = np.sum(dset['len'], dtype=np.uint64)
+        block_size=1024
+        arr_len = block_size*len(dset) + len(dset)
         filename = os.path.join(os.path.dirname(__file__), f'{split}.bin')
         dtype = np.uint16 # (can do since enc.max_token_value == 50256 is < 2**16)
         arr = np.memmap(filename, dtype=dtype, mode='w+', shape=(arr_len,))
-        total_batches = 1024
-        
-        print()
-        print(dset)
-
-
-        idx = 0
-        for batch_idx in tqdm(range(total_batches), desc=f'writing {filename}'):
-            # Batch together samples for faster write
-            batch = dset.shard(num_shards=total_batches, index=batch_idx, contiguous=True).with_format('numpy')
-            arr_batch = np.concatenate(batch['ids'])
-            # Write into mmap
-            arr[idx : idx + len(arr_batch)] = arr_batch
-            idx += len(arr_batch)
+        idx=0
+        for i in tqdm(range(len(dset))):
+          x = np.pad(dset[i]['ids'], (0, block_size-len(dset[i]['ids'])))
+          y = np.array([dset[i]['label']])
+          arr[idx : idx + block_size] = x
+          idx += block_size
+          arr[idx : idx + 1] = y
+          idx += 1
         arr.flush()
 
     # train.bin is ~17GB, val.bin ~8.5MB
